@@ -1,0 +1,17 @@
+
+{
+  "title": "The Redemption Path",
+  "genre": "thriller",
+  "duration": 60,
+  "synopsis": "A troubled detective seeks redemption through solving a mysterious case...",
+  "shots": [
+    {
+      "id": 1,
+      "title": "The Detective's Office",
+      "visual_description": "A dimly lit detective office with rain-streaked windows...",
+      "prompt": "A cinematic shot of a detective office at night, rain streaking down the windows...",
+      "negative_prompt": "blurry, low quality, cartoon, anime...",
+      "duration": 12.0
+    }
+  ]
+}

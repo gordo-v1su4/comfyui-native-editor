@@ -1,0 +1,151 @@
+//! Native video decoder backends for macOS using VideoToolbox
+//! 
+//! This crate provides hardware-accelerated video decoding using Apple's VideoToolbox framework.
+//! It supports both CPU plane copies (Phase 1) and zero-copy via IOSurface (Phase 2).
+
+use anyhow::Result;
+// Define YUV pixel formats locally to avoid cyclic dependency
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum YuvPixFmt { 
+    Nv12, 
+    P010 
+}
+use std::path::Path;
+use std::sync::Arc;
+use thiserror::Error;
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(not(target_os = "macos"))]
+mod fallback;
+
+mod wgpu_integration;
+
+/// Video frame data with YUV planes
+#[derive(Debug, Clone)]
+pub struct VideoFrame {
+    pub format: YuvPixFmt,
+    pub y_plane: Vec<u8>,
+    pub uv_plane: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub timestamp: f64,
+}
+
+/// IOSurface-based frame for zero-copy rendering
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub struct IOSurfaceFrame {
+    pub surface: io_surface::IOSurface,
+    pub format: YuvPixFmt,
+    pub width: u32,
+    pub height: u32,
+    pub timestamp: f64,
+}
+
+/// Native video decoder trait
+pub trait NativeVideoDecoder: Send + Sync {
+    /// Decode a frame at the specified timestamp
+    fn decode_frame(&mut self, timestamp: f64) -> Result<Option<VideoFrame>>;
+    
+    /// Decode a frame with zero-copy IOSurface (Phase 2)
+    #[cfg(target_os = "macos")]
+    fn decode_frame_zero_copy(&mut self, _timestamp: f64) -> Result<Option<IOSurfaceFrame>> {
+        // IOSurface zero-copy not yet implemented
+        Err(anyhow::anyhow!("IOSurface zero-copy not yet implemented"))
+    }
+    
+    /// Get video properties
+    fn get_properties(&self) -> VideoProperties;
+    
+    /// Seek to a specific timestamp
+    fn seek_to(&mut self, timestamp: f64) -> Result<()>;
+    
+    /// Check if zero-copy mode is supported
+    fn supports_zero_copy(&self) -> bool {
+        false
+    }
+}
+
+/// Video properties
+#[derive(Debug, Clone)]
+pub struct VideoProperties {
+    pub width: u32,
+    pub height: u32,
+    pub duration: f64,
+    pub frame_rate: f64,
+    pub format: YuvPixFmt,
+}
+
+/// Decoder configuration
+#[derive(Debug, Clone)]
+pub struct DecoderConfig {
+    /// Enable hardware acceleration
+    pub hardware_acceleration: bool,
+    /// Preferred pixel format
+    pub preferred_format: Option<YuvPixFmt>,
+    /// Enable zero-copy mode (IOSurface)
+    pub zero_copy: bool,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            hardware_acceleration: true,
+            preferred_format: None,
+            zero_copy: false,
+        }
+    }
+}
+
+/// Create a native video decoder for the given file
+pub fn create_decoder<P: AsRef<Path>>(
+    path: P,
+    config: DecoderConfig,
+) -> Result<Box<dyn NativeVideoDecoder>> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::create_videotoolbox_decoder(path, config)
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        fallback::create_fallback_decoder(path, config)
+    }
+}
+
+/// Check if native decoding is available on this platform
+pub fn is_native_decoding_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::is_videotoolbox_available()
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+// Re-export WGPU integration types
+pub use wgpu_integration::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decoder_config_default() {
+        let config = DecoderConfig::default();
+        assert!(config.hardware_acceleration);
+        assert!(!config.zero_copy);
+        assert!(config.preferred_format.is_none());
+    }
+
+    #[test]
+    fn test_native_decoding_availability() {
+        // This should not panic
+        let _available = is_native_decoding_available();
+    }
+}

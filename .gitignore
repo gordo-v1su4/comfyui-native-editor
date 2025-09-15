@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# Xcode / iOS
+DerivedData/
+build/
+*.xcworkspace
+*.xcuserstate
+*.pbxuser
+
+# Node / frontend
+node_modules/
+dist/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+
+# Rust / Cargo
+target/
+
+# General
+*.tmp
+*.swp

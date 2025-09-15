@@ -1,0 +1,62 @@
+#ifndef AVFOUNDATION_SHIM_H
+#define AVFOUNDATION_SHIM_H
+
+#include <stdint.h>
+#include <CoreMedia/CoreMedia.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Forward declarations
+typedef struct AVFoundationContext AVFoundationContext;
+
+typedef struct VideoPropertiesC {
+  int32_t width;
+  int32_t height;
+  double  duration;
+  double  frame_rate;
+  int32_t time_scale;
+} VideoPropertiesC;
+
+AVFoundationContext* avfoundation_create_context(const char* video_path);
+int  avfoundation_get_video_properties(AVFoundationContext* ctx, VideoPropertiesC* props);
+void* avfoundation_copy_track_format_desc(AVFoundationContext* ctx);
+void* avfoundation_read_next_sample(AVFoundationContext* ctx);
+int   avfoundation_get_reader_status(AVFoundationContext* ctx);
+int   avfoundation_seek_to(AVFoundationContext* ctx, double timestamp_sec);
+/* NEW: explicit start + first pts (debug) */
+int   avfoundation_start_reader(AVFoundationContext* ctx);
+double avfoundation_peek_first_sample_pts(AVFoundationContext* ctx);
+void  avfoundation_release_context(AVFoundationContext* ctx);
+/* existing */
+void* avfoundation_create_destination_attributes(void);
+
+// Install a global handler that logs any uncaught NSException (name, reason, callstack)
+void avf_install_uncaught_exception_handler(void);
+
+// VT wrapper functions
+#include <CoreMedia/CoreMedia.h>
+#include <VideoToolbox/VideoToolbox.h>
+
+// Call VTDecompressionSessionCreate safely (wraps in @try/@catch).
+// 'cb' is the VT output callback; 'refcon' is passed back to that callback.
+OSStatus avf_vt_create_session(CMFormatDescriptionRef fmt,
+                               CFDictionaryRef dest_attrs,
+                               VTDecompressionOutputCallback cb,
+                               void *refcon,
+                               VTDecompressionSessionRef *out_sess);
+
+// Safe wrapper around VTDecompressionSessionDecodeFrame (async).
+OSStatus avf_vt_decode_frame(VTDecompressionSessionRef sess,
+                             CMSampleBufferRef sb);
+
+// Safe wrappers for session lifecycle/utilities.
+void avf_vt_wait_async(VTDecompressionSessionRef sess);
+void avf_vt_invalidate(VTDecompressionSessionRef sess);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // AVFOUNDATION_SHIM_H

@@ -1,0 +1,22 @@
+[package]
+name = "media-io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+which = "6"
+percent-encoding = "2"
+cfg-if = "1"
+tracing = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+native-decoder = { path = "../native-decoder" }
+
+[features]
+vt = []         # AVFoundation/VideoToolbox (macOS)
+mf = []         # Media Foundation (Windows)
+vaapi = []      # VAAPI (Linux)
+gstreamer = []  # GStreamer (Linux)

@@ -1,0 +1,11 @@
+{
+    "title": "The Redemption Path",
+    "shots": [
+      {
+        "id": 1,
+        "prompt": "A cinematic shot of a detective office at night...",
+        "negative": "blurry, low quality, cartoon, anime...",
+        "seed": 123456789
+      }
+    ]
+  }

@@ -1,0 +1,13 @@
+[package]
+name = "jobs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+

@@ -1,0 +1,30 @@
+[package]
+name = "plugin-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+timeline = { path = "../timeline" }
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasmtime = "27"
+wasmtime-wasi = "27"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+prost = "0.13"
+uuid = { version = "1", features = ["v4", "serde"] }
+tempfile = "3"
+tracing = "0.1"
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+libloading = "0.8"
+sha2 = "0.10"
+zip = "0.6"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[features]
+default = []
+python-bridge = []

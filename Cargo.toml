@@ -1,0 +1,15 @@
+[workspace]
+members = [
+  "crates/timeline",
+  "crates/project",
+  "crates/media-io",
+  "crates/renderer",
+  "crates/exporters",
+  "crates/jobs",
+  "crates/plugin-host",
+  "crates/native-decoder",
+  "crates/cli",
+  "apps/desktop",
+]
+
+resolver = "2"
