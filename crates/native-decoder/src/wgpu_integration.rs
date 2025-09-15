@@ -10,6 +10,21 @@ use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 use wgpu::*;
+use std::slice;
+use core_foundation::base::TCFType;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn avf_iosurface_lock_readonly(s: *mut std::ffi::c_void);
+    fn avf_iosurface_unlock(s: *mut std::ffi::c_void);
+    fn avf_iosurface_width_of_plane(s: *mut std::ffi::c_void, plane: usize) -> usize;
+    fn avf_iosurface_height_of_plane(s: *mut std::ffi::c_void, plane: usize) -> usize;
+    fn avf_iosurface_bytes_per_row_of_plane(s: *mut std::ffi::c_void, plane: usize) -> usize;
+    fn avf_iosurface_base_address_of_plane(s: *mut std::ffi::c_void, plane: usize) -> *const std::ffi::c_void;
+}
+
+#[inline]
+fn align_up(x: u32, align: u32) -> u32 { (x + align - 1) & !(align - 1) }
 use tracing::debug;
 
 /// WGPU external texture for IOSurface integration
@@ -83,6 +98,110 @@ impl IOSurfaceTexture {
     /// Get the underlying texture
     pub fn get_texture(&self) -> &Texture {
         &self.texture
+    }
+}
+
+/// Two-plane NV12 GPU textures used by the preview renderer
+#[cfg(target_os = "macos")]
+pub struct GpuYuv {
+    pub y_tex: std::sync::Arc<Texture>,      // R8Unorm WxH
+    pub uv_tex: std::sync::Arc<Texture>,     // Rg8Unorm (W/2)x(H/2)
+}
+
+#[cfg(target_os = "macos")]
+impl GpuYuv {
+    /// Import NV12 planes from an IOSurface into two textures.
+    /// Assumes textures are created with COPY_DST | TEXTURE_BINDING usages,
+    /// with formats R8Unorm for Y and Rg8Unorm for UV.
+    pub fn import_from_iosurface(&self, queue: &Queue, frame: &IOSurfaceFrame) -> anyhow::Result<()> {
+        // Obtain raw IOSurfaceRef
+        let s_ref = frame.surface.as_concrete_TypeRef() as *mut std::ffi::c_void;
+        if s_ref.is_null() { return Ok(()); }
+
+        unsafe { avf_iosurface_lock_readonly(s_ref) };
+
+        // Plane 0 (Y)
+        let w0 = unsafe { avf_iosurface_width_of_plane(s_ref, 0) } as u32;
+        let h0 = unsafe { avf_iosurface_height_of_plane(s_ref, 0) } as u32;
+        let src_bpr0 = unsafe { avf_iosurface_bytes_per_row_of_plane(s_ref, 0) } as u32;
+        let base0 = unsafe { avf_iosurface_base_address_of_plane(s_ref, 0) } as *const u8;
+
+        // Plane 1 (interleaved UV)
+        let w1 = unsafe { avf_iosurface_width_of_plane(s_ref, 1) } as u32;
+        let h1 = unsafe { avf_iosurface_height_of_plane(s_ref, 1) } as u32;
+        let src_bpr1 = unsafe { avf_iosurface_bytes_per_row_of_plane(s_ref, 1) } as u32;
+        let base1 = unsafe { avf_iosurface_base_address_of_plane(s_ref, 1) } as *const u8;
+
+        debug!("IOSurface planes: Y {}x{} bpr={} | UV {}x{} bpr={}", w0, h0, src_bpr0, w1, h1, src_bpr1);
+
+        // Convert base addresses to slices
+        let y_src = unsafe { slice::from_raw_parts(base0, (src_bpr0 * h0) as usize) };
+        let uv_src = unsafe { slice::from_raw_parts(base1, (src_bpr1 * h1) as usize) };
+
+        // Repack rows to 256-byte multiples as required by wgpu bytes_per_row
+        const ALIGN: u32 = 256;
+
+        // Y is 1 byte per pixel
+        let dst_bpr0 = align_up(w0, ALIGN);
+        let mut y_packed = vec![0u8; (dst_bpr0 * h0) as usize];
+        for row in 0..h0 {
+            let src_off = row * src_bpr0;
+            let dst_off = row * dst_bpr0;
+            y_packed[dst_off as usize .. (dst_off + w0) as usize]
+                .copy_from_slice(&y_src[src_off as usize .. (src_off + w0) as usize]);
+        }
+
+        // UV is 2 bytes per pixel (Rg8), size w1 x h1
+        let row_bytes_uv = w1 * 2;
+        let dst_bpr1 = align_up(row_bytes_uv, ALIGN);
+        let mut uv_packed = vec![0u8; (dst_bpr1 * h1) as usize];
+        for row in 0..h1 {
+            let src_off = row * src_bpr1;
+            let dst_off = row * dst_bpr1;
+            uv_packed[dst_off as usize .. (dst_off + row_bytes_uv) as usize]
+                .copy_from_slice(&uv_src[src_off as usize .. (src_off + row_bytes_uv) as usize]);
+        }
+
+        debug!("NV12 repack: Y dst_bpr={} UV dst_bpr={}", dst_bpr0, dst_bpr1);
+
+        // Upload Y
+        queue.write_texture(
+            ImageCopyTexture {
+                texture: &self.y_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &y_packed,
+            ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(dst_bpr0),
+                rows_per_image: Some(h0),
+            },
+            Extent3d { width: w0, height: h0, depth_or_array_layers: 1 },
+        );
+
+        // Upload UV
+        queue.write_texture(
+            ImageCopyTexture {
+                texture: &self.uv_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &uv_packed,
+            ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(dst_bpr1),
+                rows_per_image: Some(h1),
+            },
+            Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+        );
+
+        debug!("NV12 wrote bytes: Y={} UV={}", y_packed.len(), uv_packed.len());
+
+        unsafe { avf_iosurface_unlock(s_ref) };
+        Ok(())
     }
 }
 

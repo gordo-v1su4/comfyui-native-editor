@@ -5,9 +5,13 @@
 
 use super::*;
 use anyhow::Context;
-use core_foundation::base::CFRetain;
-use core_foundation::string::CFString;
+use std::sync::{Arc, Mutex};
+use std::ptr;
+use core_foundation::base::{CFRetain, TCFType};
 use core_foundation::url::CFURL;
+use core_foundation::string::CFString;
+use core_video::pixel_buffer::CVPixelBuffer;
+use core_media::sample_buffer::CMSampleBuffer;
 use core_media::time::{CMTime, CMTimeValue};
 use core_media::time_range::CMTimeRange;
 use core_media::format_description::CMVideoDimensions;
@@ -15,9 +19,6 @@ use io_surface::IOSurface;
 use std::ffi::{CString, CStr};
 use std::os::raw::{c_void, c_char, c_int};
 use std::path::Path;
-use std::ptr;
-use std::sync::Arc;
-use std::sync::Mutex;
 use tracing::{debug, warn};
 
 // VideoToolbox bindings
@@ -106,14 +107,14 @@ extern "C" {
     fn avfoundation_start_reader(ctx: *mut AVFoundationContext) -> c_int;
     fn avfoundation_peek_first_sample_pts(ctx: *mut AVFoundationContext) -> f64;
     fn avfoundation_release_context(ctx: *mut AVFoundationContext);
-    fn avfoundation_create_destination_attributes() -> *mut c_void;
+    fn avfoundation_create_destination_attributes() -> *const c_void;
     
     // Uncaught exception handler
     fn avf_install_uncaught_exception_handler();
     
     // VT wrappers
     fn avf_vt_create_session(fmt: *mut std::ffi::c_void,
-                             dest_attrs: *mut std::ffi::c_void,
+                             dest_attrs: *const std::ffi::c_void,
                              cb: unsafe extern "C" fn(*mut std::ffi::c_void,
                                                       *mut std::ffi::c_void,
                                                       i32,
@@ -123,10 +124,30 @@ extern "C" {
                                                       CMTime),
                              refcon: *mut std::ffi::c_void,
                              out_sess: *mut *mut std::ffi::c_void) -> i32;
+    fn avf_vt_create_session_iosurface(fmt: *mut std::ffi::c_void,
+                                       cb: unsafe extern "C" fn(*mut std::ffi::c_void,
+                                                                *mut std::ffi::c_void,
+                                                                i32,
+                                                                u32,
+                                                                *mut std::ffi::c_void,
+                                                                CMTime,
+                                                                CMTime),
+                                       refcon: *mut std::ffi::c_void,
+                                       out_sess: *mut *mut std::ffi::c_void) -> i32;
     fn avf_vt_decode_frame(sess: *mut std::ffi::c_void,
                            sample: *mut std::ffi::c_void) -> i32;
     fn avf_vt_wait_async(sess: *mut std::ffi::c_void);
     fn avf_vt_invalidate(sess: *mut std::ffi::c_void);
+    
+    // IOSurface helpers
+    fn avf_cvpixelbuffer_get_iosurface(pixel_buffer: *mut c_void) -> *mut c_void;
+    fn avf_create_iosurface_destination_attributes(width: c_int, height: c_int) -> *const c_void;
+    fn avf_iosurface_lock_readonly(s: *mut c_void);
+    fn avf_iosurface_unlock(s: *mut c_void);
+    fn avf_iosurface_width_of_plane(s: *mut c_void, plane: usize) -> usize;
+    fn avf_iosurface_height_of_plane(s: *mut c_void, plane: usize) -> usize;
+    fn avf_iosurface_bytes_per_row_of_plane(s: *mut c_void, plane: usize) -> usize;
+    fn avf_iosurface_base_address_of_plane(s: *mut c_void, plane: usize) -> *const c_void;
 }
 
 // VideoToolbox constants
@@ -271,8 +292,9 @@ impl DecodedFrameBuffer {
 /// VideoToolbox decoder implementation
 pub struct VideoToolboxDecoder {
     session: *mut c_void,
+    iosurface_session: *mut c_void, // Separate session for IOSurface zero-copy
     format_description: *mut c_void,
-    destination_attributes: *mut c_void,
+    destination_attributes: *const c_void,
     properties: VideoProperties,
     config: DecoderConfig,
     current_timestamp: f64,
@@ -284,8 +306,11 @@ pub struct VideoToolboxDecoder {
     video_path: String,
     // Decoded frame buffer for VideoToolbox callback
     decoded_frame_buffer: Arc<Mutex<DecodedFrameBuffer>>,
+    iosurface_frame_buffer: Arc<Mutex<DecodedFrameBuffer>>, // Separate buffer for IOSurface frames
     // Raw pointer to balance Arc::into_raw() call
     decoded_frame_buffer_raw: *const std::sync::Mutex<DecodedFrameBuffer>,
+    iosurface_frame_buffer_raw: *const std::sync::Mutex<DecodedFrameBuffer>,
+    reader_started: bool,
 }
 
 unsafe impl Send for VideoToolboxDecoder {}
@@ -339,6 +364,55 @@ unsafe extern "C" fn vt_decompression_output_callback(
     }
 }
 
+// VideoToolbox IOSurface decompression output callback for zero-copy
+unsafe extern "C" fn vt_iosurface_decompression_callback(
+    decompression_output_refcon: *mut c_void,
+    _source_frame_refcon: *mut c_void,
+    status: i32,
+    _info_flags: u32,
+    image_buffer: *mut c_void,
+    presentation_time_stamp: CMTime,
+    _presentation_duration: CMTime,
+) {
+    if status != 0 {
+        debug!("VideoToolbox IOSurface callback error: {}", status);
+        return;
+    }
+    if image_buffer.is_null() {
+        debug!("VideoToolbox IOSurface callback received null image buffer");
+        return;
+    }
+    
+    // Get the IOSurface frame buffer from the refcon
+    let mtx_ptr = decompression_output_refcon as *const Mutex<DecodedFrameBuffer>;
+    if mtx_ptr.is_null() {
+        debug!("VideoToolbox IOSurface callback received null refcon");
+        return;
+    }
+    let mtx = &*mtx_ptr;
+    if let Ok(mut buffer) = mtx.lock() {
+        // CRITICAL: Retain the CVPixelBufferRef before storing it
+        CFRetain(image_buffer);
+        let decoded_frame = DecodedFrame {
+            pixel_buffer: image_buffer,
+            presentation_time: presentation_time_stamp,
+        };
+        if buffer.count < MAX_DECODED_FRAMES {
+            let write_index = buffer.write_index;
+            buffer.frames[write_index] = Some(decoded_frame);
+            buffer.write_index = (write_index + 1) % MAX_DECODED_FRAMES;
+            buffer.count += 1;
+            // Bump counters
+            buffer.cb_frames += 1;
+            buffer.last_cb_pts = CMTimeGetSeconds(presentation_time_stamp);
+            debug!("VT IOSurface cb: enqueued frame pts={}", buffer.last_cb_pts);
+        } else {
+            CFRelease(image_buffer);
+            debug!("VideoToolbox IOSurface frame buffer full, dropping frame and releasing CVPixelBufferRef");
+        }
+    }
+}
+
 impl Drop for VideoToolboxDecoder {
     fn drop(&mut self) {
         // Clean up AVFoundation context
@@ -350,13 +424,20 @@ impl Drop for VideoToolboxDecoder {
             unsafe { CFRelease(self.format_description); }
         }
         if !self.destination_attributes.is_null() {
-            unsafe { CFRelease(self.destination_attributes); }
+            unsafe { CFRelease(self.destination_attributes as *mut c_void); }
         }
         if !self.session.is_null() {
             unsafe {
                 // Ensure all callbacks are finished before invalidating
                 VTDecompressionSessionWaitForAsynchronousFrames(self.session);
                 VTDecompressionSessionInvalidate(self.session);
+            }
+        }
+        if !self.iosurface_session.is_null() {
+            unsafe {
+                // Ensure all callbacks are finished before invalidating
+                VTDecompressionSessionWaitForAsynchronousFrames(self.iosurface_session);
+                VTDecompressionSessionInvalidate(self.iosurface_session);
             }
         }
         // Clean up decoded frame buffer
@@ -370,10 +451,25 @@ impl Drop for VideoToolboxDecoder {
                 }
             }
         }
-        // CRITICAL: Balance the Arc::into_raw() call from constructor
+        // Clean up IOSurface frame buffer
+        if let Ok(mut buffer) = self.iosurface_frame_buffer.lock() {
+            for i in 0..MAX_DECODED_FRAMES {
+                if let Some(frame) = buffer.frames[i].take() {
+                    if !frame.pixel_buffer.is_null() {
+                        unsafe { CFRelease(frame.pixel_buffer); }
+                    }
+                }
+            }
+        }
+        // CRITICAL: Balance the Arc::into_raw() calls from constructor
         if !self.decoded_frame_buffer_raw.is_null() {
             unsafe {
                 let _ = Arc::from_raw(self.decoded_frame_buffer_raw);
+            }
+        }
+        if !self.iosurface_frame_buffer_raw.is_null() {
+            unsafe {
+                let _ = Arc::from_raw(self.iosurface_frame_buffer_raw);
             }
         }
     }
@@ -449,11 +545,7 @@ impl VideoToolboxDecoder {
         debug!("Created VideoToolbox decoder with properties: {}x{} @ {}fps, duration: {}s", 
                properties.width, properties.height, properties.frame_rate, properties.duration);
         
-        // Start the reader and peek first sample
-        let start_ok = unsafe { avfoundation_start_reader(avfoundation_ctx) };
-        debug!("AVF startReading -> {}", start_ok);
-        let first_pts = unsafe { avfoundation_peek_first_sample_pts(avfoundation_ctx) };
-        debug!("AVF first sample pts = {}", first_pts);
+        // Reader will be started explicitly below (once)
         
         // Get the format description from the video track
         let format_description = unsafe {
@@ -469,19 +561,21 @@ impl VideoToolboxDecoder {
         
         // Create decoded frame buffer
         let decoded_frame_buffer = Arc::new(Mutex::new(DecodedFrameBuffer::new()));
+        let iosurface_frame_buffer = Arc::new(Mutex::new(DecodedFrameBuffer::new()));
         
         // Create destination attributes
         let destination_attributes = Self::create_destination_attributes()?;
         
-        // Store raw pointer to balance Arc::into_raw() call
+        // Store raw pointers to balance Arc::into_raw() calls
         let decoded_frame_buffer_raw = Arc::into_raw(decoded_frame_buffer.clone()) as *const std::sync::Mutex<DecodedFrameBuffer>;
+        let iosurface_frame_buffer_raw = Arc::into_raw(iosurface_frame_buffer.clone()) as *const std::sync::Mutex<DecodedFrameBuffer>;
         
         // Create VTDecompressionSession using wrapper
         let mut session: *mut c_void = ptr::null_mut();
         let status = unsafe {
             avf_vt_create_session(
                 format_description as *mut _,
-                destination_attributes as *mut _,
+                destination_attributes as *const _,
                 vt_decompression_output_callback,
                 decoded_frame_buffer_raw as *mut _,
                 &mut session as *mut _ as *mut *mut _
@@ -498,8 +592,29 @@ impl VideoToolboxDecoder {
             return Err(anyhow::anyhow!("VTDecompressionSession creation returned null"));
         }
         
-        Ok(Self {
+        // Create IOSurface session for zero-copy if enabled
+        let mut iosurface_session: *mut c_void = ptr::null_mut();
+        if config.zero_copy {
+            let iosurface_status = unsafe {
+                avf_vt_create_session_iosurface(
+                    format_description as *mut _,
+                    vt_iosurface_decompression_callback,
+                    iosurface_frame_buffer_raw as *mut c_void,
+                    &mut iosurface_session as *mut *mut c_void,
+                )
+            };
+            
+            if iosurface_status != 0 {
+                debug!("Failed to create IOSurface VTDecompressionSession: {}, falling back to CPU mode", iosurface_status);
+                iosurface_session = ptr::null_mut();
+            } else {
+                debug!("Successfully created IOSurface VTDecompressionSession for zero-copy decoding");
+            }
+        }
+        
+        let mut dec = Self {
             session,
+            iosurface_session,
             format_description,
             destination_attributes,
             properties,
@@ -507,17 +622,27 @@ impl VideoToolboxDecoder {
             current_timestamp: 0.0,
             frame_cache: Arc::new(Mutex::new(Vec::new())),
             iosurface_cache: Arc::new(Mutex::new(Vec::new())),
-            zero_copy_enabled: config.zero_copy,
+            zero_copy_enabled: config.zero_copy && !iosurface_session.is_null(),
             avfoundation_ctx,
             video_path: path_str,
             decoded_frame_buffer,
+            iosurface_frame_buffer,
             decoded_frame_buffer_raw,
-        })
+            iosurface_frame_buffer_raw,
+            reader_started: false,
+        };
+        // Start AVFoundation reader exactly once
+        let start_ok = unsafe { avfoundation_start_reader(dec.avfoundation_ctx) };
+        debug!("AVF startReading -> {}", start_ok);
+        let first_pts = unsafe { avfoundation_peek_first_sample_pts(dec.avfoundation_ctx) };
+        debug!("AVF first sample pts = {}", first_pts);
+        dec.reader_started = true;
+        Ok(dec)
     }
     
     
     /// Create destination image buffer attributes
-    fn create_destination_attributes() -> Result<*mut c_void> {
+    fn create_destination_attributes() -> Result<*const c_void> {
         debug!("Creating destination attributes via Objective-C shim");
         
         let attributes = unsafe {
@@ -774,6 +899,10 @@ impl VideoToolboxDecoder {
         }
         
         self.current_timestamp = timestamp;
+        // After a seek, we must start reader again exactly once
+        let start_ok = unsafe { avfoundation_start_reader(self.avfoundation_ctx) };
+        debug!("AVF restart after seek -> {}", start_ok);
+        self.reader_started = true;
         debug!("Seek completed to timestamp: {}", timestamp);
         Ok(())
     }
@@ -844,13 +973,13 @@ impl VideoToolboxDecoder {
             return Ok(None); // End of stream
         }
         
-        // Feed the sample to VideoToolbox for decoding
+        // Ensure reader has been started (but never start here in CPU decode loop)
         if self.session.is_null() {
             return Err(anyhow::anyhow!("VTDecompressionSession is null"));
         }
         
         // Create a source frame refcon (we can use the sample buffer itself)
-        let source_frame_refcon = sample_buffer;
+        let _source_frame_refcon = sample_buffer;
         
         // Decode the frame using wrapper
         let decode_result = unsafe {
@@ -905,7 +1034,7 @@ impl VideoToolboxDecoder {
     fn decode_frame_zero_copy_internal(&mut self, timestamp: f64) -> Result<Option<IOSurfaceFrame>> {
         debug!("Decoding frame with zero-copy at timestamp: {}", timestamp);
         
-        if !self.zero_copy_enabled {
+        if !self.zero_copy_enabled || self.iosurface_session.is_null() {
             return Ok(None);
         }
         
@@ -916,11 +1045,137 @@ impl VideoToolboxDecoder {
             }
         }
         
-        // Create IOSurface for zero-copy rendering
-        // Note: This is a placeholder implementation
-        // In a real implementation, we would use the proper IOSurface API
-        // For now, we'll return an error to avoid crashes
-        Err(anyhow::anyhow!("IOSurface zero-copy not yet implemented"))
+        // Use tolerant selection from IOSurface frame buffer
+        let ring_len = { self.iosurface_frame_buffer.lock().unwrap().len() };
+        if ring_len > 0 {
+            let decoded = {
+                let mut rb = self.iosurface_frame_buffer.lock().unwrap();
+                rb.pop_nearest_at_or_before(timestamp).unwrap_or_else(|| {
+                    rb.pop_nearest_at_or_before(f64::INFINITY).expect("ring non-empty")
+                })
+            };
+            
+            let frame_time = unsafe { CMTimeGetSeconds(decoded.presentation_time) };
+            
+            // Extract IOSurface from CVPixelBuffer
+            let iosurface_ref = unsafe { avf_cvpixelbuffer_get_iosurface(decoded.pixel_buffer) };
+            if iosurface_ref.is_null() {
+                unsafe { CFRelease(decoded.pixel_buffer); }
+                return Err(anyhow::anyhow!("Failed to get IOSurface from CVPixelBuffer"));
+            }
+            
+            // Create IOSurface wrapper from raw pointer
+            let iosurface = unsafe { IOSurface::wrap_under_get_rule(iosurface_ref as _) };
+            // Use video properties for width and height since IOSurface API doesn't expose them directly
+            let width = self.properties.width;
+            let height = self.properties.height;
+            
+            let iosurface_frame = IOSurfaceFrame {
+                surface: iosurface,
+                format: YuvPixFmt::Nv12, // IOSurface is typically NV12
+                width,
+                height,
+                timestamp: frame_time,
+            };
+            
+            // Release the CVPixelBuffer (IOSurface is now managed separately)
+            unsafe { CFRelease(decoded.pixel_buffer); }
+            
+            // Cache the frame
+            if let Ok(mut cache) = self.iosurface_cache.lock() {
+                cache.push(iosurface_frame.clone());
+                if cache.len() > 10 {
+                    cache.remove(0);
+                }
+            }
+            
+            debug!("Using zero-copy IOSurface frame at timestamp: {}", frame_time);
+            return Ok(Some(iosurface_frame));
+        }
+        
+        // No suitable decoded frame available, need to decode more
+        if self.avfoundation_ctx.is_null() {
+            return Err(anyhow::anyhow!("AVFoundation context is null"));
+        }
+        
+        let reader_status = unsafe { avfoundation_get_reader_status(self.avfoundation_ctx) };
+        if reader_status != 1 { // AVAssetReaderStatusReading = 1
+            debug!("AVFoundation reader status: {}, no more samples for IOSurface", reader_status);
+            return Ok(None); // End of stream
+        }
+        
+        // Read next sample from AVFoundation
+        let sample_buffer = unsafe { avfoundation_read_next_sample(self.avfoundation_ctx) };
+        if sample_buffer.is_null() {
+            debug!("IOSurface: copyNextSampleBuffer returned NULL");
+            return Ok(None); // End of stream
+        }
+        
+        // Decode the frame using IOSurface session
+        let decode_result = unsafe {
+            avf_vt_decode_frame(self.iosurface_session, sample_buffer)
+        };
+        debug!("IOSurface VT feed: DecodeFrame status={}", decode_result);
+
+        if decode_result == 0 {
+            if let Ok(mut b) = self.iosurface_frame_buffer.lock() {
+                b.fed_samples += 1;
+                debug!("IOSurface VT feed: fed_samples={}, cb_frames={}", b.fed_samples, b.cb_frames);
+            }
+        } else {
+            debug!("IOSurface VTDecompressionSessionDecodeFrame failed: {}", decode_result);
+            unsafe { CFRelease(sample_buffer); }
+            return Err(anyhow::anyhow!("IOSurface VideoToolbox decode failed: {}", decode_result));
+        }
+
+        // Release the sample buffer
+        unsafe { CFRelease(sample_buffer); }
+
+        // Check if we now have a decoded IOSurface frame
+        if let Ok(mut buffer) = self.iosurface_frame_buffer.lock() {
+            if let Some(decoded_frame) = buffer.pop_frame() {
+                let frame_time = unsafe { CMTimeGetSeconds(decoded_frame.presentation_time) };
+                
+                // Extract IOSurface from CVPixelBuffer
+                let iosurface_ref = unsafe { avf_cvpixelbuffer_get_iosurface(decoded_frame.pixel_buffer) };
+                if iosurface_ref.is_null() {
+                    unsafe { CFRelease(decoded_frame.pixel_buffer); }
+                    return Err(anyhow::anyhow!("Failed to get IOSurface from decoded CVPixelBuffer"));
+                }
+                
+                // Create IOSurface wrapper from raw pointer
+                let iosurface = unsafe { IOSurface::wrap_under_get_rule(iosurface_ref as _) };
+                // Use video properties for width and height since IOSurface API doesn't expose them directly
+                let width = self.properties.width;
+                let height = self.properties.height;
+                
+                let iosurface_frame = IOSurfaceFrame {
+                    surface: iosurface,
+                    format: YuvPixFmt::Nv12,
+                    width,
+                    height,
+                    timestamp: frame_time,
+                };
+                
+                // Release the CVPixelBuffer
+                unsafe { CFRelease(decoded_frame.pixel_buffer); }
+
+                // Cache the frame
+                if let Ok(mut cache) = self.iosurface_cache.lock() {
+                    cache.push(iosurface_frame.clone());
+                    if cache.len() > 10 {
+                        cache.remove(0);
+                    }
+                }
+
+                debug!("Decoded IOSurface frame at timestamp: {}", frame_time);
+                return Ok(Some(iosurface_frame));
+            }
+        }
+
+        // If we get here, the decode didn't produce a frame immediately
+        debug!("No IOSurface frame available after decode attempt");
+        Ok(None)
     }
 }
 
@@ -928,12 +1183,8 @@ impl NativeVideoDecoder for VideoToolboxDecoder {
     fn decode_frame(&mut self, timestamp: f64) -> Result<Option<VideoFrame>> {
         self.current_timestamp = timestamp;
         
-        if self.config.zero_copy {
-            // Phase 2: Zero-copy mode (not yet implemented)
-            warn!("Zero-copy mode not yet implemented, falling back to CPU mode");
-        }
-        
-        // Phase 1: CPU plane copies
+        // Always use CPU mode for regular decode_frame calls
+        // Zero-copy is only available through decode_frame_zero_copy
         self.decode_frame_cpu(timestamp)
     }
     

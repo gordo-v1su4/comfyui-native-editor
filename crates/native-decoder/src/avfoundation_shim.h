@@ -30,7 +30,7 @@ int   avfoundation_start_reader(AVFoundationContext* ctx);
 double avfoundation_peek_first_sample_pts(AVFoundationContext* ctx);
 void  avfoundation_release_context(AVFoundationContext* ctx);
 /* existing */
-void* avfoundation_create_destination_attributes(void);
+const void* avfoundation_create_destination_attributes(void);
 
 // Install a global handler that logs any uncaught NSException (name, reason, callstack)
 void avf_install_uncaught_exception_handler(void);
@@ -38,6 +38,7 @@ void avf_install_uncaught_exception_handler(void);
 // VT wrapper functions
 #include <CoreMedia/CoreMedia.h>
 #include <VideoToolbox/VideoToolbox.h>
+#include <IOSurface/IOSurface.h>
 
 // Call VTDecompressionSessionCreate safely (wraps in @try/@catch).
 // 'cb' is the VT output callback; 'refcon' is passed back to that callback.
@@ -47,6 +48,12 @@ OSStatus avf_vt_create_session(CMFormatDescriptionRef fmt,
                                void *refcon,
                                VTDecompressionSessionRef *out_sess);
 
+// Create VT session with IOSurface destination attributes for zero-copy
+OSStatus avf_vt_create_session_iosurface(CMFormatDescriptionRef fmt,
+                                          VTDecompressionOutputCallback cb,
+                                          void *refcon,
+                                          VTDecompressionSessionRef *out_sess);
+
 // Safe wrapper around VTDecompressionSessionDecodeFrame (async).
 OSStatus avf_vt_decode_frame(VTDecompressionSessionRef sess,
                              CMSampleBufferRef sb);
@@ -54,6 +61,18 @@ OSStatus avf_vt_decode_frame(VTDecompressionSessionRef sess,
 // Safe wrappers for session lifecycle/utilities.
 void avf_vt_wait_async(VTDecompressionSessionRef sess);
 void avf_vt_invalidate(VTDecompressionSessionRef sess);
+
+// IOSurface helper functions
+IOSurfaceRef avf_cvpixelbuffer_get_iosurface(void* pixel_buffer);
+const void* avf_create_iosurface_destination_attributes(int width, int height);
+
+// IOSurface plane helpers (read-only)
+size_t avf_iosurface_width_of_plane(IOSurfaceRef s, size_t plane);
+size_t avf_iosurface_height_of_plane(IOSurfaceRef s, size_t plane);
+size_t avf_iosurface_bytes_per_row_of_plane(IOSurfaceRef s, size_t plane);
+const void* avf_iosurface_base_address_of_plane(IOSurfaceRef s, size_t plane);
+void avf_iosurface_lock_readonly(IOSurfaceRef s);
+void avf_iosurface_unlock(IOSurfaceRef s);
 
 #ifdef __cplusplus
 }

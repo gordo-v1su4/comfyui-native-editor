@@ -46,6 +46,7 @@ struct DecodeManager {
 
 struct DecoderEntry {
     decoder: Box<dyn NativeVideoDecoder>,
+    zc_decoder: Option<Box<dyn NativeVideoDecoder>>, // zero-copy VT session (IOSurface)
     last_pts: Option<f64>,
     last_fmt: Option<&'static str>,
     consecutive_misses: u32,
@@ -55,16 +56,24 @@ struct DecoderEntry {
 }
 
 impl DecodeManager {
+    fn normalize_path_key(path: &str) -> String {
+        std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string())
+    }
+
     fn get_or_create(&mut self, path: &str, cfg: &DecoderConfig) -> anyhow::Result<&mut DecoderEntry> {
-        if !self.decoders.contains_key(path) {
+        let key = Self::normalize_path_key(path);
+        if !self.decoders.contains_key(&key) {
             let decoder = if is_native_decoding_available() {
                 create_decoder(path, cfg.clone())?
             } else {
                 // TODO: on non-macOS, swap for MF/VAAPI backends when available.
                 create_decoder(path, cfg.clone())?
             };
-            self.decoders.insert(path.to_string(), DecoderEntry {
+            self.decoders.insert(key.clone(), DecoderEntry {
                 decoder,
+                zc_decoder: None,
                 last_pts: None,
                 last_fmt: None,
                 consecutive_misses: 0,
@@ -73,7 +82,7 @@ impl DecodeManager {
                 draws: 0,
             });
         }
-        Ok(self.decoders.get_mut(path).unwrap())
+        Ok(self.decoders.get_mut(&key).unwrap())
     }
 
     /// Try once; if None, feed the async pipeline a few steps without blocking UI.
@@ -106,8 +115,39 @@ impl DecodeManager {
         frame
     }
 
+    /// Attempt zero-copy decode via IOSurface. On macOS only.
+    #[cfg(target_os = "macos")]
+    fn decode_zero_copy(&mut self, path: &str, target_ts: f64) -> Option<native_decoder::IOSurfaceFrame> {
+        use native_decoder::YuvPixFmt as Nyf;
+        let key = Self::normalize_path_key(path);
+        let entry = if let Some(e) = self.decoders.get_mut(&key) { e } else {
+            // Initialize a CPU decoder entry first (so HUD works), then add zero-copy below.
+            let cfg = DecoderConfig { hardware_acceleration: true, preferred_format: Some(Nyf::Nv12), zero_copy: false };
+            let _ = self.get_or_create(path, &cfg);
+            self.decoders.get_mut(&key).unwrap()
+        };
+        if entry.zc_decoder.is_none() {
+            let cfg_zc = DecoderConfig { hardware_acceleration: true, preferred_format: Some(Nyf::Nv12), zero_copy: true };
+            if let Ok(dec) = create_decoder(path, cfg_zc) { entry.zc_decoder = Some(dec); } else { return None; }
+        }
+        let dec = entry.zc_decoder.as_mut().unwrap();
+        // Try a few feeds to coax out a frame without blocking long
+        let mut f = dec.decode_frame_zero_copy(target_ts).ok().flatten();
+        let mut tries = 0;
+        while f.is_none() && tries < PREFETCH_BUDGET_PER_TICK {
+            let _ = dec.decode_frame_zero_copy(target_ts);
+            tries += 1;
+            f = dec.decode_frame_zero_copy(target_ts).ok().flatten();
+        }
+        f
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn decode_zero_copy(&mut self, _path: &str, _target_ts: f64) -> Option<native_decoder::IOSurfaceFrame> { None }
+
     fn hud(&self, path: &str, target_ts: f64) -> String {
-        if let Some(e) = self.decoders.get(path) {
+        let key = Self::normalize_path_key(path);
+        if let Some(e) = self.decoders.get(&key) {
             let last = e.last_pts.unwrap_or(f64::NAN);
             let fmt = e.last_fmt.unwrap_or("?");
             let ring = e.decoder.ring_len();
@@ -126,7 +166,8 @@ impl DecodeManager {
     }
     
     fn increment_draws(&mut self, path: &str) {
-        if let Some(e) = self.decoders.get_mut(path) {
+        let key = Self::normalize_path_key(path);
+        if let Some(e) = self.decoders.get_mut(&key) {
             e.draws = e.draws.saturating_add(1);
         }
     }
@@ -464,9 +505,27 @@ impl App {
                 };
                 
                 let vf_opt = self.decode_mgr.decode_and_prefetch(&src.path, &decoder_config, t_sec as f64);
-                
-                // Always try to get YUV textures for callback, even if no new frame
-                let yuv_result = self.preview.present_yuv(&rs, &src.path, t_sec as f64);
+                // Try zero-copy first (macOS only)
+                #[cfg(target_os = "macos")]
+                let zc_opt = self.decode_mgr.decode_zero_copy(&src.path, t_sec as f64);
+                #[cfg(not(target_os = "macos"))]
+                let zc_opt: Option<native_decoder::IOSurfaceFrame> = None;
+
+                // Prefer zero-copy if available; otherwise fallback to CPU present path
+                let yuv_result = {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Some(ref zc) = zc_opt {
+                            if let Some(res) = self.preview.present_nv12_zero_copy(&rs, zc) { res } else { self.preview.present_yuv_with_frame(&rs, &src.path, t_sec as f64, vf_opt.as_ref()) }
+                        } else {
+                            self.preview.present_yuv_with_frame(&rs, &src.path, t_sec as f64, vf_opt.as_ref())
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        self.preview.present_yuv_with_frame(&rs, &src.path, t_sec as f64, vf_opt.as_ref())
+                    }
+                };
                 
                 if let Some((fmt, y, uv)) = yuv_result {
                     let use_uint = matches!(fmt, YuvPixFmt::P010) && !device_supports_16bit_norm(&rs);
@@ -478,10 +537,8 @@ impl App {
                     self.decode_mgr.increment_draws(&src.path);
                     
                     // Show HUD overlay on successful draw
-                    if vf_opt.is_none() {
-                        let hud = self.decode_mgr.hud(&src.path, t_sec as f64);
-                        painter.text(rect.left_top() + egui::vec2(5.0, 5.0), egui::Align2::LEFT_TOP, hud, egui::FontId::monospace(10.0), egui::Color32::WHITE);
-                    }
+                    let hud = self.decode_mgr.hud(&src.path, t_sec as f64);
+                    painter.text(rect.left_top() + egui::vec2(5.0, 5.0), egui::Align2::LEFT_TOP, hud, egui::FontId::monospace(10.0), egui::Color32::WHITE);
                 } else {
                     // No YUV textures available: render HUD instead of black screen
                     let hud = self.decode_mgr.hud(&src.path, t_sec as f64);
@@ -863,6 +920,12 @@ struct PreviewState {
     nv12_keys: std::collections::VecDeque<FrameCacheKey>,
     pix_fmt_map: std::collections::HashMap<String, YuvPixFmt>,
 
+    // Zero-copy NV12 cache (macOS only)
+    #[cfg(target_os = "macos")]
+    gpu_yuv: Option<native_decoder::GpuYuv>,
+    #[cfg(target_os = "macos")]
+    zc_size: (u32, u32),
+
     // Performance metrics
     cache_hits: u64,
     cache_misses: u64,
@@ -903,7 +966,43 @@ impl PreviewState {
             nv12_cache: std::collections::HashMap::new(),
             nv12_keys: std::collections::VecDeque::new(),
             pix_fmt_map: std::collections::HashMap::new(),
+            #[cfg(target_os = "macos")]
+            gpu_yuv: None,
+            #[cfg(target_os = "macos")]
+            zc_size: (0, 0),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ensure_zero_copy_nv12_textures(&mut self, rs: &eframe::egui_wgpu::RenderState, w: u32, h: u32) {
+        let y_sz = (w, h);
+        if self.gpu_yuv.is_some() && self.zc_size == y_sz { return; }
+        let device = &*rs.device;
+        eprintln!("[zc] allocate NV12 textures Y {}x{} UV {}x{}", w, h, (w + 1)/2, (h + 1)/2);
+        let y_desc = eframe::wgpu::TextureDescriptor {
+            label: Some("zc_nv12_y"),
+            size: eframe::wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: eframe::wgpu::TextureDimension::D2,
+            format: eframe::wgpu::TextureFormat::R8Unorm,
+            usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        let uv_desc = eframe::wgpu::TextureDescriptor {
+            label: Some("zc_nv12_uv"),
+            size: eframe::wgpu::Extent3d { width: (w + 1)/2, height: (h + 1)/2, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: eframe::wgpu::TextureDimension::D2,
+            format: eframe::wgpu::TextureFormat::Rg8Unorm,
+            usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        let y_tex = std::sync::Arc::new(device.create_texture(&y_desc));
+        let uv_tex = std::sync::Arc::new(device.create_texture(&uv_desc));
+        self.gpu_yuv = Some(native_decoder::GpuYuv { y_tex, uv_tex });
+        self.zc_size = y_sz;
     }
 
     // Ensure triple-buffer NV12 plane textures at native size
@@ -1225,6 +1324,11 @@ impl PreviewState {
     }
     
     fn decode_frame_async(&mut self, ctx: &egui::Context, source: VisualSource, cache_key: FrameCacheKey, t_sec: f64) {
+        // If native decoding is available and this is a video, do not spawn RGBA decoding.
+        // The persistent native decoder will feed frames via the ring buffer.
+        if !source.is_image && is_native_decoding_available() {
+            return;
+        }
         let cache = self.frame_cache.clone();
         let ctx = ctx.clone();
         
@@ -1351,6 +1455,55 @@ impl PreviewState {
                 thread::sleep(Duration::from_millis(10));
             }
         });
+    }
+
+    fn present_yuv_with_frame(
+        &mut self,
+        rs: &eframe::egui_wgpu::RenderState,
+        path: &str,
+        t_sec: f64,
+        vf_opt: Option<&native_decoder::VideoFrame>,
+    ) -> Option<(YuvPixFmt, Arc<eframe::wgpu::Texture>, Arc<eframe::wgpu::Texture>)> {
+        if let Some(vf) = vf_opt {
+            // Map NativeYuvPixFmt to local YuvPixFmt and handle P010->NV12 fallback
+            let mut fmt = match vf.format {
+                native_decoder::YuvPixFmt::Nv12 => YuvPixFmt::Nv12,
+                native_decoder::YuvPixFmt::P010 => YuvPixFmt::P010,
+            };
+            let mut y: Vec<u8> = vf.y_plane.clone();
+            let mut uv: Vec<u8> = vf.uv_plane.clone();
+            let w = vf.width; let h = vf.height;
+            if fmt == YuvPixFmt::P010 && !device_supports_16bit_norm(rs) {
+                if let Some((_f, ny, nuv, nw, nh)) = decode_video_frame_nv12_only(path, t_sec) { fmt = YuvPixFmt::Nv12; y = ny; uv = nuv; let _ = (nw, nh); }
+            }
+            let key = FrameCacheKey::new(path, t_sec, 0, 0);
+            self.nv12_cache.insert(key.clone(), Nv12Frame { fmt, y: y.clone(), uv: uv.clone(), w, h });
+            self.nv12_keys.push_back(key);
+            while self.nv12_keys.len() > 64 { if let Some(old) = self.nv12_keys.pop_front() { self.nv12_cache.remove(&old); } }
+            self.upload_yuv_planes(rs, fmt, &y, &uv, w, h);
+            let idx = self.ring_present;
+            return Some((fmt, self.y_tex[idx].as_ref().unwrap().clone(), self.uv_tex[idx].as_ref().unwrap().clone()));
+        }
+        // Fallback to old path
+        self.present_yuv(rs, path, t_sec)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn present_nv12_zero_copy(
+        &mut self,
+        rs: &eframe::egui_wgpu::RenderState,
+        zc: &native_decoder::IOSurfaceFrame,
+    ) -> Option<(YuvPixFmt, Arc<eframe::wgpu::Texture>, Arc<eframe::wgpu::Texture>)> {
+        self.ensure_zero_copy_nv12_textures(rs, zc.width, zc.height);
+        if let Some(ref yuv) = self.gpu_yuv {
+            let queue = &*rs.queue;
+            if let Err(e) = yuv.import_from_iosurface(queue, zc) {
+                eprintln!("[zc] import_from_iosurface error: {}", e);
+                return None;
+            }
+            return Some((YuvPixFmt::Nv12, yuv.y_tex.clone(), yuv.uv_tex.clone()));
+        }
+        None
     }
 }
 
@@ -1498,7 +1651,9 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
                 cache: None,
             });
             let sampler = device.create_sampler(&eframe::wgpu::SamplerDescriptor::default());
-            resources.insert(Nv12Resources { pipeline, bind_group_layout: bgl, uniform_bgl, sampler });
+            // Take ownership values, then insert to avoid overlapping borrows during insert
+            let res = Nv12Resources { pipeline, bind_group_layout: bgl, uniform_bgl, sampler };
+            resources.insert(res);
         }
 
         if self.use_uint {
@@ -1543,10 +1698,8 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
             // Create P010 uint bind groups
             let view_y = self.y_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
             let view_uv = self.uv_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
-            let tbg = {
-                let r = resources.get::<P010UintResources>().unwrap();
-                device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("p010_uint_tex_bg"), layout: &r.tex_bgl, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::TextureView(&view_y) }, eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::TextureView(&view_uv) }] })
-            };
+            let tex_layout = &resources.get::<P010UintResources>().unwrap().tex_bgl;
+            let tbg = device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("p010_uint_tex_bg"), layout: tex_layout, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::TextureView(&view_y) }, eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::TextureView(&view_uv) }] });
             resources.insert(P010UintTexBind(tbg));
             // Upload conv uniform
             // Use limited-range conversion for P010 uint (FFmpeg typically outputs limited-range)
@@ -1558,10 +1711,8 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
             let ubuf = device.create_buffer(&eframe::wgpu::BufferDescriptor { label: Some("p010_uint_ubo"), size: std::mem::size_of::<ConvStd>() as u64, usage: eframe::wgpu::BufferUsages::UNIFORM | eframe::wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             let bytes: &[u8] = unsafe { std::slice::from_raw_parts((&conv as *const ConvStd) as *const u8, std::mem::size_of::<ConvStd>()) };
             queue.write_buffer(&ubuf, 0, bytes);
-            let ubg = {
-                let r = resources.get::<P010UintResources>().unwrap();
-                device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("p010_uint_conv_bg"), layout: &r.uniform_bgl, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Buffer(eframe::wgpu::BufferBinding { buffer: &ubuf, offset: 0, size: None }) }] })
-            };
+            let uniform_layout = &resources.get::<P010UintResources>().unwrap().uniform_bgl;
+            let ubg = device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("p010_uint_conv_bg"), layout: uniform_layout, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Buffer(eframe::wgpu::BufferBinding { buffer: &ubuf, offset: 0, size: None }) }] });
             resources.insert(P010UintConvBind(ubg));
             return Vec::new();
         }
@@ -1569,10 +1720,11 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
         // Float NV12/P010 bind groups and uniform
         let view_y = self.y_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
         let view_uv = self.uv_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default());
-        let bind = {
+        let (nv_bgl, nv_samp) = {
             let r = resources.get::<Nv12Resources>().unwrap();
-            device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("preview_nv12_bg"), layout: &r.bind_group_layout, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Sampler(&r.sampler) }, eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::TextureView(&view_y) }, eframe::wgpu::BindGroupEntry { binding: 2, resource: eframe::wgpu::BindingResource::TextureView(&view_uv) }] })
+            (&r.bind_group_layout, &r.sampler)
         };
+        let bind = device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("preview_nv12_bg"), layout: nv_bgl, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Sampler(nv_samp) }, eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::TextureView(&view_y) }, eframe::wgpu::BindGroupEntry { binding: 2, resource: eframe::wgpu::BindingResource::TextureView(&view_uv) }] });
         resources.insert(Nv12BindGroup(bind));
         // Use limited-range conversion (FFmpeg typically outputs limited-range YUV)
         // Limited-range: Y 16-235, UV 16-240 (8-bit) or Y 64-940, UV 64-960 (10-bit)
@@ -1587,10 +1739,8 @@ impl egui_wgpu::CallbackTrait for PreviewYuvCallback {
         let ubuf = device.create_buffer(&eframe::wgpu::BufferDescriptor { label: Some("yuv_conv_ubo"), size: std::mem::size_of::<ConvStd>() as u64, usage: eframe::wgpu::BufferUsages::UNIFORM | eframe::wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts((&conv as *const ConvStd) as *const u8, std::mem::size_of::<ConvStd>()) };
         queue.write_buffer(&ubuf, 0, bytes);
-        let ubg = {
-            let r = resources.get::<Nv12Resources>().unwrap();
-            device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("yuv_conv_bg"), layout: &r.uniform_bgl, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Buffer(eframe::wgpu::BufferBinding { buffer: &ubuf, offset: 0, size: None }) }] })
-        };
+        let conv_layout = &resources.get::<Nv12Resources>().unwrap().uniform_bgl;
+        let ubg = device.create_bind_group(&eframe::wgpu::BindGroupDescriptor { label: Some("yuv_conv_bg"), layout: conv_layout, entries: &[eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::Buffer(eframe::wgpu::BufferBinding { buffer: &ubuf, offset: 0, size: None }) }] });
         resources.insert(ConvBindGroup(ubg));
         Vec::new()
     }

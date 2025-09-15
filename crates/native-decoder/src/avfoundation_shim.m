@@ -30,6 +30,7 @@ struct AVFoundationContext {
     int32_t time_scale;
     double nominal_fps;
     double timecode_base;
+    int reader_started;
 };
 
 // Create AVFoundation context from video file path
@@ -83,13 +84,6 @@ AVFoundationContext* avfoundation_create_context(const char* video_path) {
             
             [reader addOutput:trackOutput];
             
-            // Start reading
-            BOOL ok = [reader startReading];
-            if (!ok) {
-                NSLog(@"[shim] AVAssetReader failed to start: %@", reader.error);
-                return NULL;
-            }
-            
             // Allocate context
             AVFoundationContext* ctx = malloc(sizeof(AVFoundationContext));
             if (!ctx) {
@@ -104,6 +98,7 @@ AVFoundationContext* avfoundation_create_context(const char* video_path) {
             ctx->time_scale = videoTrack.naturalTimeScale;
             ctx->nominal_fps = videoTrack.nominalFrameRate;
             ctx->timecode_base = 0.0; // Will be set based on first frame
+            ctx->reader_started = 0;
             
             NSLog(@"Created AVFoundation context: time_scale=%d, fps=%.2f", 
                   ctx->time_scale, ctx->nominal_fps);
@@ -195,16 +190,10 @@ int avfoundation_seek_to(AVFoundationContext* ctx, double timestamp_sec) {
             
             [newReader addOutput:trackOutput];
             
-            // Start reading
-            BOOL ok = [newReader startReading];
-            if (!ok) {
-                NSLog(@"[shim] seek startReading failed: %@", newReader.error);
-                return -1;
-            }
-            
             // Update context
             ctx->reader = (__bridge_retained void*)newReader;
             ctx->track_output = (__bridge_retained void*)trackOutput;
+            ctx->reader_started = 0;
             
             NSLog(@"Seeked to timestamp: %.3f", timestamp_sec);
             return 0;
@@ -332,7 +321,7 @@ void* avfoundation_copy_track_format_desc(AVFoundationContext* ctx) {
 }
 
 // Create destination attributes for VideoToolbox decompression
-void* avfoundation_create_destination_attributes(void) {
+const void* avfoundation_create_destination_attributes(void) {
     @autoreleasepool {
         @try {
             // Request NV12 format (420YpCbCr8BiPlanarVideoRange)
@@ -352,8 +341,35 @@ int avfoundation_start_reader(AVFoundationContext* ctx) {
     @autoreleasepool {
         @try {
             if (!ctx || !ctx->reader) return -1;
+            if (ctx->reader_started) {
+                return 0; // already started
+            }
             AVAssetReader* reader = (__bridge AVAssetReader*)ctx->reader;
-            if ([reader startReading]) return 0;
+            if (reader.status == AVAssetReaderStatusFailed || reader.status == AVAssetReaderStatusCancelled) {
+                // Rebuild reader if it is in a bad state
+                AVURLAsset* asset = (__bridge AVURLAsset*)ctx->asset;
+                NSError* error = nil;
+                AVAssetReader* newReader = [AVAssetReader assetReaderWithAsset:asset error:&error];
+                if (!newReader) {
+                    NSLog(@"[shim] rebuild reader failed: %@", error);
+                    return -3;
+                }
+                // Recreate track output
+                NSArray* videoTracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+                if ([videoTracks count] == 0) {
+                    NSLog(@"No video tracks found when rebuilding reader");
+                    return -4;
+                }
+                AVAssetTrack* videoTrack = [videoTracks objectAtIndex:0];
+                AVAssetReaderTrackOutput* trackOutput = [AVAssetReaderTrackOutput 
+                    assetReaderTrackOutputWithTrack:videoTrack 
+                    outputSettings:nil];
+                [newReader addOutput:trackOutput];
+                ctx->reader = (__bridge_retained void*)newReader;
+                ctx->track_output = (__bridge_retained void*)trackOutput;
+            }
+            reader = (__bridge AVAssetReader*)ctx->reader;
+            if ([reader startReading]) { ctx->reader_started = 1; return 0; }
             NSLog(@"[shim] startReading failed: %@", reader.error);
             return -2;
         } @catch (NSException* e) {
@@ -433,3 +449,116 @@ void avf_vt_invalidate(VTDecompressionSessionRef sess) {
   }
 }
 
+// Create VT session with IOSurface destination attributes for zero-copy
+OSStatus avf_vt_create_session_iosurface(CMFormatDescriptionRef fmt,
+                                          VTDecompressionOutputCallback cb,
+                                          void *refcon,
+                                          VTDecompressionSessionRef *out_sess) {
+  @autoreleasepool {
+    @try {
+      // Get video dimensions from format description
+      CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(fmt);
+      int width = dimensions.width;
+      int height = dimensions.height;
+      
+      // Create IOSurface-backed destination attributes
+      NSDictionary* attrs = @{
+        (NSString*)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (NSString*)kCVPixelBufferWidthKey : @(width),
+        (NSString*)kCVPixelBufferHeightKey : @(height),
+        (NSString*)kCVPixelBufferIOSurfacePropertiesKey : @{},
+        (NSString*)kCVPixelBufferMetalCompatibilityKey : @(YES)
+      };
+      
+      VTDecompressionOutputCallbackRecord rec = { 
+        .decompressionOutputCallback = cb,
+        .decompressionOutputRefCon = refcon 
+      };
+      
+      return VTDecompressionSessionCreate(kCFAllocatorDefault,
+                                          fmt,
+                                          /*decoderSpecification*/ NULL,
+                                          (__bridge CFDictionaryRef)attrs,
+                                          &rec,
+                                          out_sess);
+    } @catch (NSException* e) {
+      log_exception(__func__, e);
+      return -10000;
+    }
+  }
+}
+
+// Get IOSurface from CVPixelBuffer
+IOSurfaceRef avf_cvpixelbuffer_get_iosurface(void* pixel_buffer) {
+  @autoreleasepool {
+    @try {
+      if (!pixel_buffer) {
+        return NULL;
+      }
+      
+      CVPixelBufferRef cvPixelBuffer = (CVPixelBufferRef)pixel_buffer;
+      IOSurfaceRef surface = CVPixelBufferGetIOSurface(cvPixelBuffer);
+      
+      if (surface) {
+        // Retain the IOSurface before returning
+        CFRetain(surface);
+        NSLog(@"Retrieved IOSurface from CVPixelBuffer: %dx%d", 
+              (int)IOSurfaceGetWidth(surface), 
+              (int)IOSurfaceGetHeight(surface));
+      }
+      
+      return surface;
+    } @catch (NSException* e) {
+      log_exception(__func__, e);
+      return NULL;
+    }
+  }
+}
+
+// Create IOSurface destination attributes
+const void* avf_create_iosurface_destination_attributes(int width, int height) {
+  @autoreleasepool {
+    @try {
+      NSDictionary* attrs = @{
+        (NSString*)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (NSString*)kCVPixelBufferWidthKey : @(width),
+        (NSString*)kCVPixelBufferHeightKey : @(height),
+        (NSString*)kCVPixelBufferIOSurfacePropertiesKey : @{},
+        (NSString*)kCVPixelBufferMetalCompatibilityKey : @(YES)
+      };
+      
+      NSLog(@"Created IOSurface destination attributes: %dx%d", width, height);
+      return (__bridge_retained CFDictionaryRef)attrs;
+    } @catch (NSException* e) {
+      log_exception(__func__, e);
+      return NULL;
+    }
+  }
+}
+
+// IOSurface plane helpers (read-only)
+void avf_iosurface_lock_readonly(IOSurfaceRef s) {
+  if (!s) return;
+  IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+}
+
+void avf_iosurface_unlock(IOSurfaceRef s) {
+  if (!s) return;
+  IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+}
+
+size_t avf_iosurface_width_of_plane(IOSurfaceRef s, size_t plane) {
+  return s ? IOSurfaceGetWidthOfPlane(s, plane) : 0;
+}
+
+size_t avf_iosurface_height_of_plane(IOSurfaceRef s, size_t plane) {
+  return s ? IOSurfaceGetHeightOfPlane(s, plane) : 0;
+}
+
+size_t avf_iosurface_bytes_per_row_of_plane(IOSurfaceRef s, size_t plane) {
+  return s ? IOSurfaceGetBytesPerRowOfPlane(s, plane) : 0;
+}
+
+const void* avf_iosurface_base_address_of_plane(IOSurfaceRef s, size_t plane) {
+  return s ? IOSurfaceGetBaseAddressOfPlane(s, plane) : NULL;
+}

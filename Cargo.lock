@@ -1504,6 +1504,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "d3d12"
+version = "22.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdbd1f579714e3c809ebd822c81ef148b1ceaeb3d535352afc73fd0c4c6a0017"
+dependencies = [
+ "bitflags 2.9.4",
+ "libloading 0.7.4",
+ "winapi",
+]
+
+[[package]]
 name = "dasp_sample"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3502,7 +3513,8 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "wgpu 0.20.1",
+ "tracing-subscriber",
+ "wgpu 22.1.0",
 ]
 
 [[package]]
@@ -6811,7 +6823,7 @@ dependencies = [
  "block",
  "cfg_aliases 0.1.1",
  "core-graphics-types",
- "d3d12",
+ "d3d12 0.20.0",
  "glow",
  "glutin_wgl_sys 0.5.0",
  "gpu-alloc",
@@ -6851,10 +6863,12 @@ dependencies = [
  "android_system_properties",
  "arrayvec",
  "ash 0.38.0+1.3.281",
+ "bit-set 0.6.0",
  "bitflags 2.9.4",
  "block",
  "cfg_aliases 0.1.1",
  "core-graphics-types",
+ "d3d12 22.0.0",
  "glow",
  "glutin_wgl_sys 0.6.1",
  "gpu-alloc",
@@ -6873,6 +6887,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "profiling",
+ "range-alloc",
  "raw-window-handle",
  "renderdoc-sys",
  "rustc-hash 1.1.0",
