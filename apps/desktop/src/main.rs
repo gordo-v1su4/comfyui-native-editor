@@ -37,7 +37,7 @@ fn main() {
     );
 }
 
-const PREFETCH_BUDGET_PER_TICK: usize = 4;
+const PREFETCH_BUDGET_PER_TICK: usize = 6;
 
 #[derive(Default)]
 struct DecodeManager {
@@ -50,6 +50,8 @@ struct DecoderEntry {
     last_fmt: Option<&'static str>,
     consecutive_misses: u32,
     attempts_this_tick: u32,
+    fed_samples: usize,
+    draws: u32,
 }
 
 impl DecodeManager {
@@ -67,6 +69,8 @@ impl DecodeManager {
                 last_fmt: None,
                 consecutive_misses: 0,
                 attempts_this_tick: 0,
+                fed_samples: 0,
+                draws: 0,
             });
         }
         Ok(self.decoders.get_mut(path).unwrap())
@@ -105,13 +109,25 @@ impl DecodeManager {
     fn hud(&self, path: &str, target_ts: f64) -> String {
         if let Some(e) = self.decoders.get(path) {
             let last = e.last_pts.unwrap_or(f64::NAN);
-            let fmt  = e.last_fmt.unwrap_or("?");
+            let fmt = e.last_fmt.unwrap_or("?");
+            let ring = e.decoder.ring_len();
+            let cb = e.decoder.cb_frames();
+            let last_cb = e.decoder.last_cb_pts();
+            let fed = e.decoder.fed_samples();
+            
             format!(
-                "decode: attempts {}  misses {}  last_pts {:.3}  target {:.3}  fmt {}",
-                e.attempts_this_tick, e.consecutive_misses, last, target_ts, fmt
+                "decode: attempts {}  misses {}  last_pts {:.3}  target {:.3}  fmt {}\nring {}  cb {}  last_cb {:.3}  fed {}  draws {}",
+                e.attempts_this_tick, e.consecutive_misses, last, target_ts, fmt,
+                ring, cb, last_cb, fed, e.draws
             )
         } else {
             format!("decode: initializing…  target {:.3}", target_ts)
+        }
+    }
+    
+    fn increment_draws(&mut self, path: &str) {
+        if let Some(e) = self.decoders.get_mut(path) {
+            e.draws = e.draws.saturating_add(1);
         }
     }
 }
@@ -448,18 +464,26 @@ impl App {
                 };
                 
                 let vf_opt = self.decode_mgr.decode_and_prefetch(&src.path, &decoder_config, t_sec as f64);
-                if let Some(vf) = vf_opt {
-                    // Keep existing fast GPU path
-                    if let Some((fmt, y, uv)) = self.preview.present_yuv(&rs, &src.path, t_sec as f64) {
-                        let use_uint = matches!(fmt, YuvPixFmt::P010) && !device_supports_16bit_norm(&rs);
-                        let cb = egui_wgpu::Callback::new_paint_callback(
-                            rect,
-                            PreviewYuvCallback { y_tex: y, uv_tex: uv, fmt, use_uint },
-                        );
-                        ui.painter().add(cb);
+                
+                // Always try to get YUV textures for callback, even if no new frame
+                let yuv_result = self.preview.present_yuv(&rs, &src.path, t_sec as f64);
+                
+                if let Some((fmt, y, uv)) = yuv_result {
+                    let use_uint = matches!(fmt, YuvPixFmt::P010) && !device_supports_16bit_norm(&rs);
+                    let cb = egui_wgpu::Callback::new_paint_callback(
+                        rect,
+                        PreviewYuvCallback { y_tex: y, uv_tex: uv, fmt, use_uint },
+                    );
+                    ui.painter().add(cb);
+                    self.decode_mgr.increment_draws(&src.path);
+                    
+                    // Show HUD overlay on successful draw
+                    if vf_opt.is_none() {
+                        let hud = self.decode_mgr.hud(&src.path, t_sec as f64);
+                        painter.text(rect.left_top() + egui::vec2(5.0, 5.0), egui::Align2::LEFT_TOP, hud, egui::FontId::monospace(10.0), egui::Color32::WHITE);
                     }
                 } else {
-                    // No frame yet: render HUD instead of plain "decoding..."
+                    // No YUV textures available: render HUD instead of black screen
                     let hud = self.decode_mgr.hud(&src.path, t_sec as f64);
                     painter.text(rect.center(), egui::Align2::CENTER_CENTER, hud, egui::FontId::monospace(12.0), egui::Color32::LIGHT_GRAY);
                 }

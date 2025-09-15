@@ -66,6 +66,18 @@ pub trait NativeVideoDecoder: Send + Sync {
     fn supports_zero_copy(&self) -> bool {
         false
     }
+    
+    /// Get ring buffer length for HUD display (optional)
+    fn ring_len(&self) -> usize { 0 }
+    
+    /// Get callback frame count for HUD display (optional)
+    fn cb_frames(&self) -> usize { 0 }
+    
+    /// Get last callback PTS for HUD display (optional)
+    fn last_cb_pts(&self) -> f64 { f64::NAN }
+    
+    /// Get fed samples count for HUD display (optional)
+    fn fed_samples(&self) -> usize { 0 }
 }
 
 /// Video properties

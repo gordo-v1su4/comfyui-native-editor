@@ -201,6 +201,54 @@ impl DecodedFrameBuffer {
         self.count == MAX_DECODED_FRAMES
     }
     
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Pop the frame whose pts is <= target and closest to it; fall back to oldest if none <= target.
+    /// Returns None only if the buffer is empty.
+    pub fn pop_nearest_at_or_before(&mut self, target: f64) -> Option<DecodedFrame> {
+        if self.count == 0 {
+            return None;
+        }
+
+        // linear scan is fine (small ring)
+        let mut best_idx: Option<usize> = None;
+        let mut best_dt = f64::INFINITY;
+        
+        for i in 0..MAX_DECODED_FRAMES {
+            if let Some(ref frame) = self.frames[i] {
+                let pts = unsafe { CMTimeGetSeconds(frame.presentation_time) };
+                if pts <= target {
+                    let dt = target - pts;
+                    if dt < best_dt {
+                        best_dt = dt;
+                        best_idx = Some(i);
+                    }
+                }
+            }
+        }
+        
+        if let Some(i) = best_idx {
+            let frame = self.frames[i].take();
+            self.read_index = (i + 1) % MAX_DECODED_FRAMES;
+            self.count -= 1;
+            return frame;
+        }
+        
+        // nothing <= target: pop oldest non-null
+        for i in 0..MAX_DECODED_FRAMES {
+            let idx = (self.read_index + i) % MAX_DECODED_FRAMES;
+            if self.frames[idx].is_some() {
+                let frame = self.frames[idx].take();
+                self.read_index = (idx + 1) % MAX_DECODED_FRAMES;
+                self.count -= 1;
+                return frame;
+            }
+        }
+        None
+    }
+    
     fn pop_frame(&mut self) -> Option<DecodedFrame> {
         if self.count == 0 {
             return None;
@@ -332,6 +380,26 @@ impl Drop for VideoToolboxDecoder {
 }
 
 impl VideoToolboxDecoder {
+    /// Get ring buffer length for HUD display
+    pub fn ring_len(&self) -> usize {
+        self.decoded_frame_buffer.lock().unwrap().len()
+    }
+    
+    /// Get callback frame count for HUD display  
+    pub fn cb_frames(&self) -> usize {
+        self.decoded_frame_buffer.lock().unwrap().cb_frames
+    }
+    
+    /// Get last callback PTS for HUD display
+    pub fn last_cb_pts(&self) -> f64 {
+        self.decoded_frame_buffer.lock().unwrap().last_cb_pts
+    }
+    
+    /// Get fed samples count for HUD display
+    pub fn fed_samples(&self) -> usize {
+        self.decoded_frame_buffer.lock().unwrap().fed_samples
+    }
+
     /// Create a new VideoToolbox decoder
     pub fn new<P: AsRef<Path>>(path: P, config: DecoderConfig) -> Result<Self> {
         // Install uncaught exception handler to catch any Obj-C exceptions
@@ -722,36 +790,37 @@ impl VideoToolboxDecoder {
             }
         }
         
-        // Check if we have a decoded frame in our buffer that matches the timestamp
-        if let Ok(mut buffer) = self.decoded_frame_buffer.lock() {
-            // Look for a frame with PTS >= timestamp - epsilon
-            let epsilon = 0.1; // 100ms tolerance
-            let target_time = timestamp - epsilon;
+        // Use tolerant selection - never return "no frame" if ring has any data
+        let ring_len = { self.decoded_frame_buffer.lock().unwrap().len() };
+        if ring_len == 0 {
+            // Ring is genuinely empty → producer didn't feed yet, continue to decode more
+        } else {
+            // Ring has data - use tolerant selection to always get a frame
+            let decoded = {
+                let mut rb = self.decoded_frame_buffer.lock().unwrap();
+                rb.pop_nearest_at_or_before(timestamp).unwrap_or_else(|| {
+                    // ring not empty but no suitable <= target (e.g., only future frames):
+                    // pop the oldest so UI always shows something
+                    rb.pop_nearest_at_or_before(f64::INFINITY).expect("ring non-empty")
+                })
+            };
             
-            // Check if we have a suitable frame
-            if let Some(frame) = buffer.peek_frame() {
-                let frame_time = unsafe { CMTimeGetSeconds(frame.presentation_time) };
-                if frame_time >= target_time {
-                    // Pop the frame and convert it
-                    if let Some(decoded_frame) = buffer.pop_frame() {
-                        let video_frame = Self::cvpixelbuffer_to_videoframe(decoded_frame.pixel_buffer, frame_time)?;
-                        
-                        // CRITICAL: Release the CVPixelBufferRef after copying the data
-                        unsafe { CFRelease(decoded_frame.pixel_buffer); }
-                        
-                        // Cache the frame
-                        if let Ok(mut cache) = self.frame_cache.lock() {
-                            cache.push(video_frame.clone());
-                            if cache.len() > 10 {
-                                cache.remove(0);
-                            }
-                        }
-                        
-                        debug!("Using decoded frame at timestamp: {}", frame_time);
-                        return Ok(Some(video_frame));
-                    }
+            let frame_time = unsafe { CMTimeGetSeconds(decoded.presentation_time) };
+            let video_frame = Self::cvpixelbuffer_to_videoframe(decoded.pixel_buffer, frame_time)?;
+            
+            // CRITICAL: Release the CVPixelBufferRef after copying the data
+            unsafe { CFRelease(decoded.pixel_buffer); }
+            
+            // Cache the frame
+            if let Ok(mut cache) = self.frame_cache.lock() {
+                cache.push(video_frame.clone());
+                if cache.len() > 10 {
+                    cache.remove(0);
                 }
             }
+            
+            debug!("Using tolerant decoded frame at timestamp: {}", frame_time);
+            return Ok(Some(video_frame));
         }
         
         // No suitable decoded frame available, need to decode more
@@ -887,6 +956,22 @@ impl NativeVideoDecoder for VideoToolboxDecoder {
     
     fn decode_frame_zero_copy(&mut self, timestamp: f64) -> Result<Option<IOSurfaceFrame>> {
         self.decode_frame_zero_copy_internal(timestamp)
+    }
+    
+    fn ring_len(&self) -> usize {
+        self.ring_len()
+    }
+    
+    fn cb_frames(&self) -> usize {
+        self.cb_frames()
+    }
+    
+    fn last_cb_pts(&self) -> f64 {
+        self.last_cb_pts()
+    }
+    
+    fn fed_samples(&self) -> usize {
+        self.fed_samples()
     }
 }
 
