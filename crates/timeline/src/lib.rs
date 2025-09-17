@@ -1,10 +1,29 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod graph;
+pub use graph::*;
+mod commands;
+pub use commands::*;
+
 #[derive(Debug, Error)]
 pub enum TimelineError {
     #[error("invalid operation: {0}")]
     InvalidOp(String),
+    #[error("node already exists: {0}")]
+    NodeExists(NodeId),
+    #[error("node not found: {0}")]
+    NodeNotFound(NodeId),
+    #[error("track not found: {0}")]
+    TrackNotFound(TrackId),
+    #[error("automation lane not found: {0}")]
+    LaneNotFound(LaneId),
+    #[error("edge already exists between {0} -> {1}")]
+    EdgeExists(NodeId, NodeId),
+    #[error("edge not found between {0} -> {1}")]
+    EdgeNotFound(NodeId, NodeId),
+    #[error("history empty: {0}")]
+    HistoryEmpty(&'static str),
 }
 
 pub type Frame = i64; // 1-based time in frames, supports negatives for offsets
@@ -76,11 +95,21 @@ pub struct Sequence {
     pub fps: Fps,
     pub duration_in_frames: Frame,
     pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub graph: TimelineGraph,
 }
 
 impl Sequence {
     pub fn new(name: impl Into<String>, width: u32, height: u32, fps: Fps, duration_in_frames: Frame) -> Self {
-        Self { name: name.into(), width, height, fps, duration_in_frames, tracks: Vec::new() }
+        Self {
+            name: name.into(),
+            width,
+            height,
+            fps,
+            duration_in_frames,
+            tracks: Vec::new(),
+            graph: TimelineGraph::default(),
+        }
     }
 
     pub fn add_track(&mut self, track: Track) { self.tracks.push(track); }

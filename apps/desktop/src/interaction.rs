@@ -1,13 +1,18 @@
+use timeline::{NodeId, TimelineNode, TrackId};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DragMode { Move, TrimStart, TrimEnd }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DragState {
-    pub track: usize,
-    pub item: usize,
+    pub original_track_index: usize,
+    pub current_track_index: usize,
     pub mode: DragMode,
     pub start_mouse_x: f32,
     pub orig_from: i64,
     pub orig_dur: i64,
+    pub node_id: NodeId,
+    pub original_node: TimelineNode,
+    pub original_track_id: TrackId,
+    pub original_position: usize,
 }
-

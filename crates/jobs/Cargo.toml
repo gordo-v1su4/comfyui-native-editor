@@ -10,4 +10,6 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4"] }
-
+project = { path = "../project" }
+media-io = { path = "../media-io" }
+serde_json = "1"

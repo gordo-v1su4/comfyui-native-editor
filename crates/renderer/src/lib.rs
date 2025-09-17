@@ -5,6 +5,9 @@ use std::borrow::Cow;
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
+mod cpu;
+pub use cpu::convert_yuv_to_rgba;
+
 #[derive(Debug, Error)]
 pub enum RendererError {
     #[error("WGPU error: {0}")]

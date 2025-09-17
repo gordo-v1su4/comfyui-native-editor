@@ -154,19 +154,20 @@ impl ProjectDb {
 
     pub fn list_assets(&self, project_id: &str) -> Result<Vec<AssetRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, src_abs, width, height, duration_frames, fps_num, fps_den \
+            "SELECT id, project_id, kind, src_abs, width, height, duration_frames, fps_num, fps_den \
              FROM assets WHERE project_id = ?1 ORDER BY created_at DESC LIMIT 1000",
         )?;
         let rows = stmt.query_map(params![project_id], |row| {
             Ok(AssetRow {
                 id: row.get(0)?,
-                kind: row.get(1)?,
-                src_abs: row.get(2)?,
-                width: row.get(3)?,
-                height: row.get(4)?,
-                duration_frames: row.get(5)?,
-                fps_num: row.get(6)?,
-                fps_den: row.get(7)?,
+                project_id: row.get(1)?,
+                kind: row.get(2)?,
+                src_abs: row.get(3)?,
+                width: row.get(4)?,
+                height: row.get(5)?,
+                duration_frames: row.get(6)?,
+                fps_num: row.get(7)?,
+                fps_den: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -178,6 +179,7 @@ impl ProjectDb {
 #[derive(Debug, Clone)]
 pub struct AssetRow {
     pub id: String,
+    pub project_id: String,
     pub kind: String,
     pub src_abs: String,
     pub width: Option<i64>,
@@ -185,6 +187,61 @@ pub struct AssetRow {
     pub duration_frames: Option<i64>,
     pub fps_num: Option<i64>,
     pub fps_den: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobRow {
+    pub id: String,
+    pub asset_id: String,
+    pub kind: String,
+    pub priority: i32,
+}
+
+impl ProjectDb {
+    pub fn get_asset(&self, asset_id: &str) -> Result<AssetRow> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, kind, src_abs, width, height, duration_frames, fps_num, fps_den \
+             FROM assets WHERE id = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![asset_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(AssetRow {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                kind: row.get(2)?,
+                src_abs: row.get(3)?,
+                width: row.get(4)?,
+                height: row.get(5)?,
+                duration_frames: row.get(6)?,
+                fps_num: row.get(7)?,
+                fps_den: row.get(8)?,
+            })
+        } else {
+            Err(anyhow::anyhow!("asset not found"))
+        }
+    }
+
+    pub fn reset_running_jobs(&self) -> Result<()> {
+        self.conn.execute("UPDATE jobs SET status='pending' WHERE status='running'", [])?;
+        Ok(())
+    }
+
+    pub fn list_pending_jobs(&self) -> Result<Vec<JobRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, asset_id, kind, priority FROM jobs WHERE status = 'pending' ORDER BY priority DESC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(JobRow {
+                id: row.get(0)?,
+                asset_id: row.get(1)?,
+                kind: row.get(2)?,
+                priority: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
 }
 
 fn apply_migrations(conn: &Connection) -> Result<()> {

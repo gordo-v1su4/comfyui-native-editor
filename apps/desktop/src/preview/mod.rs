@@ -1,0 +1,53 @@
+pub mod state;
+pub mod ui;
+
+pub(crate) use state::{PreviewShaderMode, PreviewState, PreviewYuvCallback};
+
+use serde_json::Value;
+use timeline_crate::{ClipNode, FrameRange, TimelineGraph, TimelineNode, TimelineNodeKind, TrackKind};
+
+use crate::VisualSource;
+
+pub(crate) fn visual_source_at(graph: &TimelineGraph, playhead: i64) -> Option<VisualSource> {
+    for binding in graph.tracks.iter().rev() {
+        if matches!(binding.kind, TrackKind::Audio) { continue; }
+        for node_id in binding.node_ids.iter() {
+            let node = graph.nodes.get(node_id)?;
+            let Some(range) = node_frame_range(node) else { continue; };
+            if playhead < range.start || playhead >= range.end() { continue; }
+            match &node.kind {
+                TimelineNodeKind::Clip(clip) => return clip_source(binding, clip),
+                TimelineNodeKind::Generator { generator_id, metadata, .. } => {
+                    if let Some(src) = generator_source(generator_id, metadata) { return Some(src); }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn node_frame_range(node: &TimelineNode) -> Option<FrameRange> {
+    match &node.kind {
+        TimelineNodeKind::Clip(clip) => Some(clip.timeline_range.clone()),
+        TimelineNodeKind::Generator { timeline_range, .. } => Some(timeline_range.clone()),
+        _ => None,
+    }
+}
+
+fn clip_source(binding: &timeline_crate::TrackBinding, clip: &ClipNode) -> Option<VisualSource> {
+    let path = clip.asset_id.clone()?;
+    let is_image = matches!(binding.kind, TrackKind::Custom(ref id) if id == "image");
+    Some(VisualSource { path, is_image })
+}
+
+fn generator_source(generator_id: &str, metadata: &Value) -> Option<VisualSource> {
+    match generator_id {
+        "solid" => {
+            let color = metadata.get("color").and_then(|v| v.as_str()).unwrap_or("#000000");
+            Some(VisualSource { path: format!("solid:{}", color), is_image: true })
+        }
+        "text" => Some(VisualSource { path: "text://generator".into(), is_image: true }),
+        _ => None,
+    }
+}

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::{Arc, Mutex}};
+use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 #[derive(Clone)]
@@ -11,7 +11,6 @@ pub struct AudioBuffer {
 
 #[derive(Clone)]
 pub struct ActiveAudioClip {
-    pub path: PathBuf,
     pub start_tl_sec: f64,   // timeline position
     pub start_media_sec: f64,
     pub duration_sec: f64,
