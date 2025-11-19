@@ -248,5 +248,9 @@ For questions, bug reports, or feature requests, please open an issue on the pro
 
 ---
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=gausian-AI/Gausian_native_editor&type=date&legend=top-left)](https://www.star-history.com/#gausian-AI/Gausian_native_editor&type=date&legend=top-left)
+
 **Built with ❤️ in Rust** | **GPU-Accelerated** | **Cross-Platform** | **Open Source**
 
